@@ -99,56 +99,58 @@ def _extract_geojson_feature_array_start(buffer: str) -> Optional[int]:
 
 def _iter_geojson_features(geojson_path: str) -> Iterator[Dict[str, Any]]:
     """
-    Stream features from a GeoJSON FeatureCollection without materializing the full file.
+    Stream features from a GeoJSON FeatureCollection safely without 
+    materializing the full file into memory.
     """
     decoder = json.JSONDecoder()
-    chunk_size = 1 << 20
-
+    chunk_size = 64 * 1024  # 64KB chunks are highly efficient for text streaming
+    
     with open(geojson_path, "r", encoding="utf-8") as fh:
         buffer = ""
-        start_idx: Optional[int] = None
-
-        while start_idx is None:
+        found_features_start = False
+        
+        while True:
             chunk = fh.read(chunk_size)
             if not chunk:
-                return
+                break
             buffer += chunk
-            start_idx = _extract_geojson_feature_array_start(buffer)
-            if start_idx is not None:
-                buffer = buffer[start_idx:]
-                break
-
-        idx = 0
-        while True:
-            while True:
-                if idx >= len(buffer):
-                    chunk = fh.read(chunk_size)
-                    if not chunk:
-                        return
-                    buffer = buffer[idx:] + chunk
-                    idx = 0
+            
+            # Find the start of the features array if we haven't yet
+            if not found_features_start:
+                start_idx = _extract_geojson_feature_array_start(buffer)
+                if start_idx is not None:
+                    buffer = buffer[start_idx:]
+                    found_features_start = True
+                else:
+                    # Keep only the tail end of the buffer to match regex across boundaries
+                    if len(buffer) > 1024:
+                        buffer = buffer[-1024:]
                     continue
-                ch = buffer[idx]
-                if ch in " \t\r\n,":
+            
+            # Parse objects out of the buffer
+            idx = 0
+            while idx < len(buffer):
+                # Skip whitespace and separators
+                while idx < len(buffer) and buffer[idx] in " \t\r\n,:":
                     idx += 1
-                    continue
-                break
-
-            if idx >= len(buffer):
-                continue
-            if buffer[idx] == "]":
-                return
-
-            try:
-                obj, end = decoder.raw_decode(buffer, idx)
-                yield obj
-                idx = end
-            except json.JSONDecodeError:
-                chunk = fh.read(chunk_size)
-                if not chunk:
-                    raise
-                buffer = buffer[idx:] + chunk
-                idx = 0
+                    
+                if idx >= len(buffer):
+                    break
+                    
+                if buffer[idx] == "]":
+                    return # Reached the end of the features array
+                    
+                try:
+                    obj, end = decoder.raw_decode(buffer, idx)
+                    if isinstance(obj, dict) and obj.get("type") == "Feature":
+                        yield obj
+                    idx = end
+                except json.JSONDecodeError:
+                    # Incomplete JSON object in buffer, break to read more chunks
+                    break
+            
+            # Slide the buffer down to discard what we've already parsed
+            buffer = buffer[idx:]
 
 
 def _iter_relevant_osm_tags(tags: Iterable[Tuple[str, str]]) -> Dict[str, str]:
@@ -346,7 +348,6 @@ def parse_osm_xml_python(osm_file_path: str, writer, is_first: bool) -> Tuple[bo
         except OSError:
             pass
 
-
 def ingest_usfs_blm_geojson(geojson_path: str, source: str, writer, is_first: bool) -> Tuple[bool, int]:
     """
     Parses agency GeoJSON (BLM or USFS) and maps attributes to the RUT hierarchy.
@@ -360,17 +361,34 @@ def ingest_usfs_blm_geojson(geojson_path: str, source: str, writer, is_first: bo
     processed = 0
 
     for feat in _iter_geojson_features(geojson_path):
-        props = feat.get("properties", {})
-        geom = feat.get("geometry", {})
+        # CRITICAL SAFETY CHECK: Ensure this object is actually a valid GeoJSON Feature map
+        if not isinstance(feat, dict) or "properties" not in feat or "geometry" not in feat:
+            continue
+            
+        props = feat.get("properties")
+        geom = feat.get("geometry")
+
+        # Guard against malformed feature rows missing dictionary internals
+        if not isinstance(props, dict) or not isinstance(geom, dict):
+            continue
 
         if geom.get("type") not in ("LineString", "MultiLineString"):
             continue
 
         # USFS/BLM attributes mapping
-        # USFS often uses 'SURFACE_TYPE' or 'OPER_MAINT_LEVEL'
-        # BLM access datasets use similar attributes.
-        surf_type = (props.get("SURFACE_TYPE") or props.get("surface") or "").lower()
-        maint_level = str(props.get("OPER_MAINT_LEVEL") or props.get("maint_level") or "")
+        surf_type = (
+            props.get("SURFACETYP")
+            or props.get("SURFACE_TYPE")
+            or props.get("surface")
+            or ""
+        ).lower()
+
+        maint_level = str(
+            props.get("OPERATIONA")
+            or props.get("OPER_MAINT_LEVEL")
+            or props.get("maint_level")
+            or ""
+        )
 
         # Mapping rules based on typical USFS/BLM attributes
         if maint_level in ("1", "Basic Custodial Care (Closed)") or "dirt" in surf_type or "native" in surf_type:
@@ -399,7 +417,6 @@ def ingest_usfs_blm_geojson(geojson_path: str, source: str, writer, is_first: bo
 
     print(f"Successfully processed {processed} roads from {source}.")
     return is_first, processed
-
 
 def export_to_geojson(output_path: str):
     """
